@@ -18,7 +18,7 @@ Karena dataset MHEALTH memiliki label aktivitas asli (`activity_label`), proses 
 - [Ringkasan Proyek](#ringkasan-proyek)
 - [Dataset](#dataset)
 - [Variabel](#variabel)
-- [Label Aktivitas](#label-aktivitas)
+- [Label Aktivitas](#label-aktivitas)  
 - [Alur Analisis](#alur-analisis)
 - [Preprocessing Data Besar](#preprocessing-data-besar)
 - [Algoritma Clustering](#algoritma-clustering)
@@ -240,18 +240,8 @@ Interpretasi umum:
 
 ## Cara Menjalankan
 
-### 1. Clone repository
 
-```bash
-git clone https://github.com/USERNAME/MHEALTH-Unsupervised-Clustering.git
-cd MHEALTH-Unsupervised-Clustering
-```
-
-Ganti `USERNAME` dengan username GitHub Anda.
-
----
-
-### 2. Siapkan dataset
+### 1. Siapkan dataset
 
 Pastikan file berikut tersedia:
 
@@ -265,7 +255,7 @@ Jika dataset belum tersedia, unduh dataset MHEALTH dari UCI Machine Learning Rep
 
 ---
 
-### 3. Install package R yang dibutuhkan
+### 2. Install package R yang dibutuhkan
 
 Jalankan kode berikut di RStudio:
 
@@ -293,12 +283,12 @@ install.packages(c(
 
 ---
 
-### 4. Render laporan
+### 3. Render laporan
 
 Jalankan:
 
 ```r
-rmarkdown::render("mhealth_unsupervised_clustering_optimized_with_interpretation.Rmd")
+rmarkdown::render("Projek SML_Razan Nur Muhammad Ihsan 3338240032.Rmd")
 ```
 
 Atau buka file `.Rmd` di RStudio, lalu klik:
@@ -306,50 +296,6 @@ Atau buka file `.Rmd` di RStudio, lalu klik:
 ```text
 Knit → Knit to HTML
 ```
-
----
-
-## Catatan Data Besar
-
-File `mhealth_combined_10_subjects.csv` memiliki ukuran besar karena berisi lebih dari satu juta baris data sensor. Jika GitHub menolak upload file CSV, terdapat beberapa solusi:
-
-### Opsi 1 — Jangan upload CSV ke repository
-
-Tambahkan file CSV ke `.gitignore`:
-
-```text
-*.csv
-*.RData
-*.Rhistory
-.Rproj.user/
-```
-
-Kemudian tulis instruksi pada README agar pengguna mengunduh dataset secara manual.
-
-### Opsi 2 — Gunakan Git LFS
-
-Jika tetap ingin mengunggah dataset besar, gunakan Git Large File Storage:
-
-```bash
-git lfs install
-git lfs track "*.csv"
-git add .gitattributes
-git add mhealth_combined_10_subjects.csv
-git commit -m "Add dataset using Git LFS"
-git push origin main
-```
-
-### Opsi 3 — Gunakan GitHub Release
-
-Dataset dapat diunggah sebagai file tambahan pada halaman **Release**, sedangkan repository utama hanya berisi script dan dokumentasi.
-
----
-
-## Sitasi Dataset
-
-Jika menggunakan dataset ini, sitasi yang disarankan:
-
-> Banos, O., Garcia, R., & Saez, A. (2014). MHEALTH [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5TW22
 
 ---
 
@@ -371,10 +317,6 @@ Analisis ini menghasilkan:
 
 ## Tentang
 
-Proyek ini dibuat untuk tugas **Statistical Machine Learning** dengan fokus pada penerapan **unsupervised learning** dan **clustering** pada data sensor time-series.
+Proyek  **Statistical Machine Learning** dengan penerapan **unsupervised learning** dan **clustering** pada data sensor time-series.
 
-Analisis dilakukan dengan menyesuaikan karakteristik dataset MHEALTH yang berukuran besar, sehingga preprocessing dilakukan melalui windowing, feature extraction, standardisasi, dan PCA sebelum clustering.
-
-**Penulis:** Razan Nur Muhammad Ihsan  
-**NIM:** 3338240032  
-**Project:** MHEALTH-Unsupervised-Clustering
+Analisis dilakukan dengan menyesuaikan karakteristik dataset MHEALTH yang  besar, sehingga preprocessing dilakukan melalui windowing, feature extraction, standardisasi, dan PCA sebelum clustering.
