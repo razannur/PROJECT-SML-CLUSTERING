@@ -21,9 +21,7 @@ Karena dataset MHEALTH memiliki label aktivitas asli (`activity_label`), proses 
 - [Preprocessing Data Besar](#preprocessing-data-besar)
 - [Algoritma Clustering](#algoritma-clustering)
 - [Validasi Cluster](#validasi-cluster)
-- [Struktur File](#struktur-file)
 - [Cara Menjalankan](#cara-menjalankan)
-- [Catatan Data Besar](#catatan-data-besar)
 - [Sitasi Dataset](#sitasi-dataset)
 - [Tentang](#tentang)
 
