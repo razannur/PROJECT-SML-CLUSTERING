@@ -1,0 +1,1279 @@
+---
+title: "Analisis Unsupervised Learning dan Clustering pada Dataset MHEALTH"
+subtitle: "Optimasi Data Time-Series Sensor dengan Windowing, Ekstraksi Fitur, PCA, Clustering, dan Validasi"
+author: "Razan Nur Muhammad Ihsan 3338240032"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+linestretch: 1.2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 8,
+  fig.height = 5,
+  dpi        = 300,
+  out.width  = "95%"
+)
+options(width = 100)
+set.seed(123)
+```
+
+# Load Library
+
+Bagian ini memuat library yang digunakan dalam analisis. Dataset MHEALTH memiliki ukuran besar karena berupa data sensor time-series, sehingga pembacaan data menggunakan `data.table::fread()` agar lebih cepat dan hemat memori.
+
+```{r load-library}
+required_packages <- c(
+  "data.table",   # membaca dan memproses data besar
+  "dplyr",        # manipulasi data
+  "ggplot2",      # visualisasi
+  "cluster",      # PAM dan silhouette
+  "factoextra",   # visualisasi cluster
+  "mclust",       # Gaussian Mixture Model dan ARI
+  "dbscan",       # DBSCAN dan kNN distance plot
+  "clusterCrit",  # Rand Index
+  "clue",         # Hungarian matching untuk akurasi cluster
+  "fpc",          # cluster.stats
+  "clusterSim",   # Davies-Bouldin Index
+  "knitr",        # tabel laporan
+  "scales"        # format angka
+)
+
+installed <- rownames(installed.packages())
+missing_packages <- setdiff(required_packages, installed)
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+# Deskripsi Dataset
+
+Dataset yang digunakan adalah **MHEALTH (Mobile Health)**. Dataset ini berisi rekaman sensor gerak dan tanda vital dari beberapa subjek saat melakukan aktivitas fisik. Setiap baris pada data asli bukan merepresentasikan satu responden, tetapi satu titik waktu pengukuran sensor. Karena itu, dataset ini tidak boleh langsung diperlakukan seperti data tabular biasa.
+
+Dalam analisis ini, baris sensor mentah akan diubah menjadi fitur ringkasan berbasis window waktu. Setiap window merepresentasikan potongan aktivitas dalam durasi tertentu.
+
+```{r parameter-analisis}
+# PARAMETER UTAMA ANALISIS
+
+# Letakkan file CSV di folder kerja RStudio yang sama dengan Rmd ini.
+data_file <- "mhealth_combined_10_subjects.csv"
+
+# MHEALTH direkam pada 50 Hz, artinya sekitar 50 observasi per detik.
+sampling_rate <- 50
+
+# Window 2 detik = 100 baris per subjek.
+# Jika komputer berat, naikkan menjadi 5 detik.
+window_seconds <- 2
+window_size_rows <- sampling_rate * window_seconds
+
+# Label 0 adalah null class. Untuk clustering aktivitas utama, biasanya dikeluarkan.
+# Jika ingin semua data termasuk label 0, ubah menjadi FALSE.
+remove_null_activity <- TRUE
+
+# Jumlah aktivitas utama pada MHEALTH adalah 12.
+# Nilai ini hanya dipakai sebagai referensi pembanding/validasi, bukan sebagai variabel input clustering.
+k_reference <- 12
+
+# Strategi jumlah cluster:
+# "reference"   = menggunakan k_reference = 12 agar hasil cluster dapat dibandingkan dengan 12 aktivitas.
+# "silhouette"  = menggunakan k terbaik dari silhouette method.
+k_strategy <- "reference"
+
+# Batas jumlah data untuk metode yang membutuhkan matriks jarak.
+# Jangan terlalu besar karena dist() bersifat memory-intensive.
+max_distance_rows <- 3000
+max_hclust_rows <- 3000
+max_pam_rows <- 5000
+max_gmm_rows <- 7000
+max_internal_validation_rows <- 5000
+
+# PCA
+pca_variance_target <- 0.90
+max_pcs <- 20
+
+# DBSCAN
+min_pts_dbscan <- 5
+eps_quantile <- 0.90
+
+# Gap statistic sangat berat. Aktifkan hanya jika komputer kuat.
+run_gap_statistic <- FALSE
+```
+
+```{r import-dataset}
+# Deteksi file CSV secara fleksibel agar tetap berjalan bila nama file berubah,
+# misalnya menjadi mhealth_combined_10_subjects(1).csv setelah download ulang.
+if (!file.exists(data_file)) {
+  candidate_files <- list.files(pattern = "^mhealth_combined_10_subjects.*\\.csv$", ignore.case = TRUE)
+  if (length(candidate_files) > 0) {
+    data_file <- candidate_files[1]
+    cat("File utama tidak ditemukan. Menggunakan file:", data_file, "\n")
+  } else {
+    stop(paste0("File '", data_file, "' tidak ditemukan. Letakkan CSV di working directory RStudio."))
+  }
+}
+
+mhealth_raw <- data.table::fread(data_file)
+
+cat("Dimensi data mentah:", nrow(mhealth_raw), "baris x", ncol(mhealth_raw), "kolom\n")
+cat("Ukuran objek di memori:", format(object.size(mhealth_raw), units = "MB"), "\n")
+
+knitr::kable(
+  head(mhealth_raw, 5),
+  caption = "Lima Baris Pertama Dataset MHEALTH"
+)
+```
+
+```{r struktur-data}
+# Mapping label aktivitas berdasarkan dokumentasi MHEALTH.
+activity_map <- data.table(
+  activity_label = 0:12,
+  activity_name = c(
+    "Null class",
+    "Standing still",
+    "Sitting and relaxing",
+    "Lying down",
+    "Walking",
+    "Climbing stairs",
+    "Waist bends forward",
+    "Frontal elevation of arms",
+    "Knees bending/crouching",
+    "Cycling",
+    "Jogging",
+    "Running",
+    "Jump front and back"
+  )
+)
+
+sensor_cols <- setdiff(names(mhealth_raw), c("subject_id", "activity_label"))
+
+summary_dataset <- data.frame(
+  Komponen = c(
+    "Jumlah baris mentah",
+    "Jumlah kolom",
+    "Jumlah subjek",
+    "Jumlah kolom sensor",
+    "Sampling rate",
+    "Ukuran window",
+    "Label aktivitas unik"
+  ),
+  Nilai = c(
+    scales::comma(nrow(mhealth_raw)),
+    ncol(mhealth_raw),
+    length(unique(mhealth_raw$subject_id)),
+    length(sensor_cols),
+    paste0(sampling_rate, " Hz"),
+    paste0(window_seconds, " detik (", window_size_rows, " baris)"),
+    paste(sort(unique(mhealth_raw$activity_label)), collapse = ", ")
+  )
+)
+
+knitr::kable(summary_dataset, caption = "Ringkasan Dataset MHEALTH")
+knitr::kable(activity_map, caption = "Kode Label Aktivitas MHEALTH")
+```
+
+# Seleksi Variabel
+
+Variabel yang dipakai untuk clustering adalah kolom sensor numerik. Kolom `subject_id` tidak digunakan sebagai fitur clustering karena hanya menunjukkan identitas subjek. Kolom `activity_label` juga tidak digunakan dalam proses clustering karena clustering bersifat unsupervised. Label aktivitas hanya digunakan setelah clustering untuk validasi eksternal.
+
+```{r seleksi-variabel}
+# Pastikan tipe data benar
+mhealth_raw[, subject_id := as.factor(subject_id)]
+mhealth_raw[, activity_label := as.integer(activity_label)]
+
+# Filter null class jika diperlukan.
+if (remove_null_activity) {
+  mhealth <- mhealth_raw[activity_label != 0]
+} else {
+  mhealth <- copy(mhealth_raw)
+}
+
+cat("Dimensi setelah filter label 0:", nrow(mhealth), "baris x", ncol(mhealth), "kolom\n")
+
+sensor_info <- data.frame(
+  No = seq_along(sensor_cols),
+  Sensor = sensor_cols
+)
+
+knitr::kable(sensor_info, caption = "Variabel Sensor yang Digunakan sebagai Input Clustering")
+```
+
+# Eksplorasi Data (EDA)
+
+EDA dilakukan untuk memahami distribusi data, mengecek missing value, melihat distribusi aktivitas, dan memeriksa karakteristik sensor. Karena data mentah sangat besar, beberapa visualisasi menggunakan sampel agar proses tetap ringan.
+
+## Missing Value
+
+```{r missing-value}
+missing_summary <- data.frame(
+  Kolom = names(mhealth),
+  Missing = colSums(is.na(mhealth)),
+  Persentase = round(colSums(is.na(mhealth)) / nrow(mhealth) * 100, 4)
+)
+
+knitr::kable(
+  missing_summary,
+  caption = "Ringkasan Missing Value per Kolom"
+)
+
+cat("Total missing value:", sum(is.na(mhealth)), "\n")
+```
+
+
+```{r interpretasi-missing-value, results='asis', echo=FALSE}
+total_missing <- sum(missing_summary$Missing, na.rm = TRUE)
+missing_cols <- missing_summary[missing_summary$Missing > 0, , drop = FALSE]
+
+if (total_missing == 0) {
+  cat("**Interpretasi:** Tidak ditemukan missing value pada data yang dianalisis. Kondisi ini baik karena proses standarisasi, PCA, dan clustering dapat dilakukan tanpa imputasi pada data mentah. Walaupun demikian, pengecekan missing value tetap penting karena algoritma seperti K-Means, GMM, PAM, dan DBSCAN tidak dapat bekerja baik jika masih terdapat nilai kosong.\n")
+} else {
+  top_missing <- missing_cols[order(-missing_cols$Missing), ][1, ]
+  cat("**Interpretasi:** Terdapat **", scales::comma(total_missing), "** missing value pada dataset. Kolom dengan missing value terbanyak adalah **", top_missing$Kolom, "** sebesar **", top_missing$Persentase, "%**. Nilai kosong ini perlu ditangani sebelum clustering agar jarak antarobservasi tidak bias.\n", sep = "")
+}
+```
+
+## Distribusi Aktivitas
+
+```{r distribusi-aktivitas}
+activity_dist <- as.data.table(table(mhealth$activity_label))
+setnames(activity_dist, c("activity_label", "N"))
+activity_dist[, activity_label := as.integer(as.character(activity_label))]
+activity_dist <- merge(activity_dist, activity_map, by = "activity_label", all.x = TRUE)
+activity_dist[, Persentase := round(N / sum(N) * 100, 2)]
+
+knitr::kable(
+  activity_dist[order(activity_label)],
+  caption = "Distribusi Aktivitas pada Data yang Dianalisis",
+  format.args = list(big.mark = ",")
+)
+
+ggplot(activity_dist, aes(x = factor(activity_label), y = N)) +
+  geom_col() +
+  geom_text(aes(label = scales::comma(N)), vjust = -0.3, size = 3) +
+  labs(
+    title = "Distribusi Observasi per Aktivitas",
+    x = "Label Aktivitas",
+    y = "Jumlah Observasi"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-distribusi-aktivitas, results='asis', echo=FALSE}
+activity_top <- activity_dist[which.max(N)]
+activity_low <- activity_dist[which.min(N)]
+imbalance_ratio <- as.numeric(activity_top$N / max(activity_low$N, 1))
+
+top_name <- ifelse(is.na(activity_top$activity_name), paste("Label", activity_top$activity_label), activity_top$activity_name)
+low_name <- ifelse(is.na(activity_low$activity_name), paste("Label", activity_low$activity_label), activity_low$activity_name)
+
+cat("**Interpretasi:** Distribusi aktivitas digunakan sebagai pembanding eksternal setelah clustering selesai. Aktivitas dengan observasi terbanyak adalah **", top_name, "** sebanyak **", scales::comma(activity_top$N), "** observasi, sedangkan yang paling sedikit adalah **", low_name, "** sebanyak **", scales::comma(activity_low$N), "** observasi. ", sep = "")
+
+if (imbalance_ratio >= 2) {
+  cat("Perbedaannya cukup besar, sehingga hasil clustering berpotensi lebih mudah membentuk cluster untuk aktivitas yang dominan dan lebih sulit menangkap aktivitas yang jumlahnya kecil.\n")
+} else {
+  cat("Sebaran aktivitas relatif tidak terlalu timpang, sehingga setiap aktivitas masih memiliki peluang cukup seimbang untuk muncul dalam pembentukan cluster.\n")
+}
+```
+
+## Statistik Deskriptif Sensor
+
+```{r statistik-sensor}
+# Versi aman: tidak menggunakan t() atau data.table::transpose().
+# Cara sebelumnya bisa gagal karena hasil lapply(.SD, ...) berupa list/matrix
+# yang bentuk dimensinya tidak selalu konsisten saat di-knit.
+sensor_summary_t <- data.table::rbindlist(lapply(sensor_cols, function(col) {
+  x <- mhealth[[col]]
+  data.table::data.table(
+    Sensor = col,
+    mean = mean(x, na.rm = TRUE),
+    sd = sd(x, na.rm = TRUE),
+    min = min(x, na.rm = TRUE),
+    median = median(x, na.rm = TRUE),
+    max = max(x, na.rm = TRUE)
+  )
+}))
+
+knitr::kable(
+  sensor_summary_t,
+  digits = 4,
+  caption = "Statistik Deskriptif Kolom Sensor"
+)
+```
+
+
+```{r interpretasi-statistik-sensor, results='asis', echo=FALSE}
+max_sd_sensor <- sensor_summary_t[which.max(sd)]
+min_sd_sensor <- sensor_summary_t[which.min(sd)]
+max_range_sensor <- sensor_summary_t[which.max(max - min)]
+
+cat("**Interpretasi:** Tabel statistik deskriptif menunjukkan karakter dasar setiap sensor sebelum diekstraksi menjadi fitur window. Sensor dengan variasi terbesar berdasarkan standar deviasi adalah **", max_sd_sensor$Sensor, "** dengan sd = **", round(max_sd_sensor$sd, 4), "**, sedangkan sensor yang paling stabil adalah **", min_sd_sensor$Sensor, "** dengan sd = **", round(min_sd_sensor$sd, 4), "**. Sensor dengan rentang nilai terbesar adalah **", max_range_sensor$Sensor, "**. Perbedaan variasi ini menjadi alasan utama mengapa standarisasi diperlukan sebelum menghitung jarak dan melakukan clustering.\n", sep = "")
+```
+
+## Histogram dan Boxplot Sensor Sampel
+
+```{r visualisasi-sensor-sample}
+set.seed(123)
+eda_sample_n <- min(10000, nrow(mhealth))
+eda_sample <- mhealth[sample(.N, eda_sample_n)]
+
+sensor_plot_cols <- sensor_cols[1:min(6, length(sensor_cols))]
+eda_long <- data.table::melt(
+  eda_sample[, ..sensor_plot_cols],
+  measure.vars = sensor_plot_cols,
+  variable.name = "Sensor",
+  value.name = "Nilai"
+)
+
+ggplot(eda_long, aes(x = Nilai)) +
+  geom_histogram(bins = 40) +
+  facet_wrap(~ Sensor, scales = "free") +
+  labs(
+    title = "Histogram Beberapa Sensor pada Sampel Data",
+    x = "Nilai Sensor",
+    y = "Frekuensi"
+  ) +
+  theme_bw()
+
+ggplot(eda_long, aes(x = Sensor, y = Nilai)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Boxplot Beberapa Sensor pada Sampel Data",
+    x = "Sensor",
+    y = "Nilai"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-visualisasi-sensor, results='asis', echo=FALSE}
+cat("**Interpretasi:** Histogram memperlihatkan bentuk sebaran nilai beberapa sensor, sedangkan boxplot membantu melihat perbedaan skala, variasi, dan kemungkinan outlier. Pada data sensor gerak, nilai ekstrem tidak selalu berarti kesalahan input; nilai tersebut bisa muncul karena perubahan gerakan yang cepat, transisi aktivitas, atau perbedaan gaya bergerak antar subjek. Karena itu, data tidak langsung dibuang, tetapi diringkas melalui windowing dan distandarisasi agar pola utamanya lebih stabil untuk clustering.\n")
+```
+
+# Pembentukan Window dan Ekstraksi Fitur Time-Series
+
+Dataset MHEALTH adalah data time-series sensor. Jika clustering dilakukan langsung pada 1 juta baris data mentah, hasilnya kurang stabil dan beberapa metode seperti hierarchical clustering akan gagal karena membutuhkan matriks jarak sangat besar. Oleh karena itu, data sensor diringkas per window waktu.
+
+Pada setiap window, dihitung fitur statistik berikut:
+
+- `mean`: rata-rata sinyal sensor
+- `sd`: variasi sinyal sensor
+- `min`: nilai minimum
+- `max`: nilai maksimum
+- `rms`: root mean square, menggambarkan energi sinyal
+
+```{r fungsi-windowing}
+get_mode <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_integer_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+extract_window_features <- function(dt, sensor_columns, window_size_rows) {
+  dt <- copy(dt)
+  dt[, row_index := seq_len(.N), by = subject_id]
+  dt[, window_id := floor((row_index - 1) / window_size_rows) + 1L, by = subject_id]
+
+  feature_dt <- dt[, c(
+    list(
+      n_obs = .N,
+      activity_label = get_mode(activity_label)
+    ),
+    unlist(
+      lapply(.SD, function(x) {
+        list(
+          mean = mean(x, na.rm = TRUE),
+          sd   = sd(x, na.rm = TRUE),
+          min  = min(x, na.rm = TRUE),
+          max  = max(x, na.rm = TRUE),
+          rms  = sqrt(mean(x^2, na.rm = TRUE))
+        )
+      }),
+      recursive = FALSE
+    )
+  ), by = .(subject_id, window_id), .SDcols = sensor_columns]
+
+  return(feature_dt)
+}
+```
+
+```{r buat-window-features}
+window_features <- extract_window_features(
+  dt = mhealth,
+  sensor_columns = sensor_cols,
+  window_size_rows = window_size_rows
+)
+
+# Rapikan nama kolom agar mudah dipakai.
+setnames(window_features, make.names(names(window_features), unique = TRUE))
+
+cat("Dimensi data setelah windowing:", nrow(window_features), "baris x", ncol(window_features), "kolom\n")
+cat("Reduksi jumlah baris:", round((1 - nrow(window_features) / nrow(mhealth)) * 100, 2), "%\n")
+
+knitr::kable(
+  head(window_features, 5),
+  caption = "Lima Baris Pertama Data Hasil Windowing dan Ekstraksi Fitur"
+)
+```
+
+
+```{r interpretasi-windowing, results='asis', echo=FALSE}
+reduction_pct <- round((1 - nrow(window_features) / nrow(mhealth)) * 100, 2)
+cat("**Interpretasi:** Proses windowing mengubah data dari **", scales::comma(nrow(mhealth)), "** baris sensor mentah menjadi **", scales::comma(nrow(window_features)), "** baris window, atau berkurang sekitar **", reduction_pct, "%**. Pengurangan ini penting karena metode berbasis jarak tidak realistis dijalankan langsung pada jutaan titik waktu. Setiap baris window sekarang mewakili ringkasan pola sensor selama sekitar **", window_seconds, " detik**, bukan hanya satu titik pengukuran.\n", sep = "")
+```
+
+# Standarisasi Data
+
+Karena sensor memiliki skala dan satuan yang berbeda, seluruh fitur numerik harus distandarisasi menggunakan z-score. Standarisasi dilakukan setelah ekstraksi fitur, bukan pada data mentah, agar ukuran data lebih efisien.
+
+```{r standarisasi}
+id_cols <- c("subject_id", "window_id", "n_obs", "activity_label")
+feature_cols <- setdiff(names(window_features), id_cols)
+
+# Ganti nilai infinite menjadi NA, lalu imputasi dengan median.
+for (col in feature_cols) {
+  set(window_features, which(!is.finite(window_features[[col]])), col, NA_real_)
+  med <- median(window_features[[col]], na.rm = TRUE)
+  if (is.na(med)) med <- 0
+  set(window_features, which(is.na(window_features[[col]])), col, med)
+}
+
+feature_matrix <- as.matrix(window_features[, ..feature_cols])
+feature_scaled <- scale(feature_matrix)
+feature_scaled[is.na(feature_scaled)] <- 0
+
+cat("Dimensi feature matrix setelah scaling:", nrow(feature_scaled), "baris x", ncol(feature_scaled), "kolom\n")
+```
+
+
+```{r interpretasi-standarisasi, results='asis', echo=FALSE}
+cat("**Interpretasi:** Setelah standarisasi, setiap fitur berada pada skala yang sebanding. Ini mencegah sensor dengan nilai numerik besar mendominasi perhitungan jarak. Secara praktis, K-Means, PAM, Hierarchical, dan DBSCAN akan membandingkan pola relatif antar window, bukan hanya besar kecilnya satuan sensor tertentu.\n")
+```
+
+# Reduksi Dimensi dengan PCA
+
+PCA digunakan untuk mengurangi dimensi fitur, mempercepat clustering, dan mengurangi noise. Komponen utama yang dipakai adalah sejumlah komponen yang menjelaskan minimal `r pca_variance_target * 100`% variasi data, tetapi dibatasi maksimal `r max_pcs` komponen.
+
+```{r pca}
+pca_model <- prcomp(feature_scaled, center = FALSE, scale. = FALSE)
+var_exp <- pca_model$sdev^2 / sum(pca_model$sdev^2)
+cum_var <- cumsum(var_exp)
+
+n_pcs <- which(cum_var >= pca_variance_target)[1]
+if (is.na(n_pcs)) n_pcs <- min(max_pcs, ncol(pca_model$x))
+n_pcs <- min(n_pcs, max_pcs, ncol(pca_model$x))
+
+pca_data <- pca_model$x[, seq_len(n_pcs), drop = FALSE]
+
+pca_summary <- data.frame(
+  PC = paste0("PC", seq_along(var_exp)),
+  Variance = round(var_exp * 100, 3),
+  Cumulative = round(cum_var * 100, 3)
+)
+
+knitr::kable(
+  head(pca_summary, max(10, n_pcs)),
+  caption = "Proporsi Variansi PCA"
+)
+
+cat("Jumlah PC yang digunakan:", n_pcs, "\n")
+cat("Variansi kumulatif:", round(cum_var[n_pcs] * 100, 2), "%\n")
+
+ggplot(pca_summary[1:min(20, nrow(pca_summary)), ], aes(x = seq_along(Variance), y = Cumulative)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = pca_variance_target * 100, linetype = 2) +
+  labs(
+    title = "Cumulative Explained Variance PCA",
+    x = "Jumlah Principal Component",
+    y = "Variansi Kumulatif (%)"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-pca, results='asis', echo=FALSE}
+pc12_var <- if (length(var_exp) >= 2) round(sum(var_exp[1:2]) * 100, 2) else round(var_exp[1] * 100, 2)
+cat("**Interpretasi:** PCA mempertahankan **", n_pcs, "** komponen utama dengan variansi kumulatif sekitar **", round(cum_var[n_pcs] * 100, 2), "%**. Dua komponen pertama menjelaskan sekitar **", pc12_var, "%** variasi. Jika plot PCA 2D masih menunjukkan tumpang tindih, hal itu wajar karena visualisasi hanya memakai dua dimensi, sedangkan proses clustering menggunakan hingga **", n_pcs, "** komponen.\n", sep = "")
+```
+
+# Perhitungan Jarak
+
+Materi distance-based clustering menggunakan jarak, misalnya Euclidean distance, sebagai ukuran kemiripan objek. Namun, pada dataset besar, `dist()` tidak boleh dihitung pada seluruh data karena akan membentuk matriks jarak berukuran sangat besar. Oleh karena itu, perhitungan jarak hanya dilakukan pada sampel data hasil windowing.
+
+```{r perhitungan-jarak}
+set.seed(123)
+distance_idx <- sample(seq_len(nrow(pca_data)), min(max_distance_rows, nrow(pca_data)))
+pca_distance_sample <- pca_data[distance_idx, , drop = FALSE]
+
+dist_sample <- dist(pca_distance_sample, method = "euclidean")
+
+cat("Jumlah baris untuk perhitungan jarak:", nrow(pca_distance_sample), "\n")
+cat("Ringkasan jarak Euclidean pada sampel:\n")
+print(summary(as.vector(dist_sample)))
+```
+
+
+```{r interpretasi-jarak, results='asis', echo=FALSE}
+dist_values <- as.vector(dist_sample)
+cat("**Interpretasi:** Ringkasan jarak Euclidean pada sampel menunjukkan seberapa jauh perbedaan pola antar window setelah scaling dan PCA. Median jarak sebesar **", round(median(dist_values), 4), "** dapat dianggap sebagai gambaran jarak tipikal antar window. Jarak minimum yang sangat kecil menunjukkan adanya window dengan pola sensor mirip, sedangkan jarak maksimum yang besar menunjukkan adanya window dengan pola aktivitas yang jauh berbeda.\n", sep = "")
+```
+
+# Penentuan Jumlah Cluster Optimal
+
+Jumlah cluster optimal ditentukan menggunakan metode internal, terutama Elbow Method dan Silhouette Method. Gap Statistic juga disediakan, tetapi secara default dimatikan karena cukup berat untuk data besar.
+
+```{r penentuan-k}
+set.seed(123)
+eval_idx <- sample(seq_len(nrow(pca_data)), min(max_distance_rows, nrow(pca_data)))
+pca_eval <- pca_data[eval_idx, , drop = FALSE]
+
+dist_eval <- dist(pca_eval)
+
+k_grid <- 2:min(15, nrow(pca_eval) - 1)
+
+wss_values <- numeric(length(k_grid))
+sil_values <- numeric(length(k_grid))
+
+for (i in seq_along(k_grid)) {
+  k <- k_grid[i]
+  km_tmp <- kmeans(pca_eval, centers = k, nstart = 10, iter.max = 100)
+  wss_values[i] <- km_tmp$tot.withinss
+  sil_values[i] <- mean(silhouette(km_tmp$cluster, dist_eval)[, "sil_width"])
+}
+
+k_table <- data.frame(
+  k = k_grid,
+  WSS = wss_values,
+  Avg_Silhouette = sil_values
+)
+
+k_silhouette <- k_table$k[which.max(k_table$Avg_Silhouette)]
+
+knitr::kable(
+  k_table,
+  digits = 4,
+  caption = "Perbandingan WSS dan Average Silhouette untuk Kandidat k"
+)
+
+cat("k terbaik berdasarkan Silhouette:", k_silhouette, "\n")
+cat("k referensi berdasarkan jumlah aktivitas:", k_reference, "\n")
+
+if (k_strategy == "silhouette") {
+  k_final <- k_silhouette
+} else {
+  k_final <- k_reference
+}
+
+cat("k yang digunakan untuk clustering utama:", k_final, "\n")
+```
+
+```{r visualisasi-k-optimal}
+ggplot(k_table, aes(x = k, y = WSS)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Elbow Method",
+    x = "Jumlah Cluster (k)",
+    y = "Total Within-Cluster Sum of Squares"
+  ) +
+  theme_bw()
+
+ggplot(k_table, aes(x = k, y = Avg_Silhouette)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = k_silhouette, linetype = 2) +
+  labs(
+    title = "Silhouette Method",
+    x = "Jumlah Cluster (k)",
+    y = "Average Silhouette Width"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-k-optimal, results='asis', echo=FALSE}
+best_sil_row <- k_table[which.max(k_table$Avg_Silhouette), ]
+cat("**Interpretasi:** Berdasarkan Silhouette Method, kandidat jumlah cluster terbaik adalah **k = ", best_sil_row$k, "** dengan average silhouette **", round(best_sil_row$Avg_Silhouette, 4), "**. Pada analisis utama digunakan **k = ", k_final, "**. ", sep = "")
+if (k_final == k_silhouette) {
+  cat("Artinya jumlah cluster utama mengikuti hasil validasi internal silhouette.\n")
+} else {
+  cat("Nilai ini dipilih sebagai referensi karena dataset MHEALTH memiliki 12 aktivitas utama, sehingga hasil cluster lebih mudah diverifikasi terhadap label aktivitas asli. Perbedaan antara k silhouette dan k referensi perlu dibaca sebagai kompromi antara struktur data dan tujuan evaluasi.\n")
+}
+```
+
+```{r gap-statistic, eval=TRUE}
+if (run_gap_statistic) {
+  set.seed(123)
+  gap_result <- clusGap(
+    pca_eval,
+    FUN = kmeans,
+    K.max = min(15, nrow(pca_eval) - 1),
+    B = 20,
+    nstart = 10
+  )
+  print(gap_result)
+  factoextra::fviz_gap_stat(gap_result)
+} else {
+  cat("Gap Statistic tidak dijalankan karena opsi run_gap_statistic = FALSE.\n")
+}
+```
+
+# Metode Clustering 1: K-Means
+
+K-Means adalah algoritma partitioning clustering yang membagi data ke dalam `k` cluster dengan meminimalkan jarak objek terhadap centroid cluster. Pada data MHEALTH, K-Means dijalankan pada data PCA hasil ekstraksi fitur window.
+
+```{r kmeans}
+set.seed(123)
+km_result <- kmeans(
+  pca_data,
+  centers = k_final,
+  nstart = 25,
+  iter.max = 300
+)
+
+window_features[, Cluster_KMeans := as.factor(km_result$cluster)]
+
+cat("Ukuran cluster K-Means:\n")
+print(table(window_features$Cluster_KMeans))
+cat("Total within-cluster sum of squares:", km_result$tot.withinss, "\n")
+```
+
+```{r plot-kmeans}
+pca_plot <- data.frame(
+  PC1 = pca_data[, 1],
+  PC2 = pca_data[, 2],
+  Cluster = window_features$Cluster_KMeans,
+  Activity = as.factor(window_features$activity_label)
+)
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - K-Means",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-kmeans, results='asis', echo=FALSE}
+km_tab <- table(window_features$Cluster_KMeans)
+km_ratio <- max(km_tab) / max(min(km_tab), 1)
+cat("**Interpretasi K-Means:** Plot PCA memperlihatkan bagaimana K-Means membagi data berdasarkan kedekatan terhadap centroid. Ukuran cluster terbesar adalah **", scales::comma(max(km_tab)), "** window dan terkecil **", scales::comma(min(km_tab)), "** window. ", sep = "")
+if (km_ratio > 5) {
+  cat("Perbedaan ukuran cluster cukup besar, sehingga sebagian cluster mungkin merepresentasikan aktivitas dominan atau gabungan beberapa pola sensor yang mirip.\n")
+} else {
+  cat("Ukuran cluster relatif masih seimbang, sehingga pemisahan K-Means tidak terlalu didominasi oleh satu cluster saja.\n")
+}
+```
+
+# Metode Clustering 2: Gaussian Mixture Model (GMM)
+
+GMM adalah model-based clustering yang mengasumsikan data berasal dari campuran beberapa distribusi Gaussian. Berbeda dari K-Means, GMM menghasilkan probabilitas keanggotaan cluster. Karena GMM cukup berat, model dilatih pada sampel jika jumlah window terlalu besar, lalu digunakan untuk memprediksi seluruh window.
+
+```{r gmm}
+set.seed(123)
+gmm_idx <- sample(seq_len(nrow(pca_data)), min(max_gmm_rows, nrow(pca_data)))
+pca_gmm_train <- pca_data[gmm_idx, , drop = FALSE]
+
+gmm_result <- Mclust(pca_gmm_train, G = k_final, verbose = FALSE)
+gmm_pred <- predict(gmm_result, newdata = pca_data)
+
+window_features[, Cluster_GMM := as.factor(gmm_pred$classification)]
+
+cat("Model GMM terpilih:", gmm_result$modelName, "\n")
+cat("Jumlah data training GMM:", nrow(pca_gmm_train), "\n")
+cat("Ukuran cluster GMM:\n")
+print(table(window_features$Cluster_GMM))
+
+summary(gmm_result)
+```
+
+```{r plot-gmm}
+plot(gmm_result, what = "BIC")
+
+pca_plot$Cluster <- window_features$Cluster_GMM
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - Gaussian Mixture Model",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-gmm, results='asis', echo=FALSE}
+gmm_tab <- table(window_features$Cluster_GMM)
+cat("**Interpretasi GMM:** GMM menggunakan pendekatan probabilistik, sehingga lebih fleksibel dibanding K-Means ketika bentuk cluster tidak sepenuhnya bulat. Model yang digunakan adalah **", gmm_result$modelName, "**. Jika plot GMM tampak berbeda dari K-Means, hal itu menunjukkan bahwa asumsi distribusi Gaussian dan kovarians cluster memengaruhi cara data dipisahkan. Ukuran cluster terbesar pada GMM adalah **", scales::comma(max(gmm_tab)), "** window.\n", sep = "")
+```
+
+# Metode Clustering 3: Hierarchical Clustering (Average Linkage)
+
+Hierarchical clustering membutuhkan matriks jarak. Karena `dist()` pada seluruh data MHEALTH dapat menghasilkan kebutuhan memori sangat besar, hierarchical clustering hanya dilakukan pada sampel window. Hasil sampel kemudian digunakan untuk membuat centroid pendekatan, lalu seluruh data diberi cluster berdasarkan centroid terdekat. Ini adalah pendekatan praktis agar metode hierarchical tetap dapat ditampilkan sesuai materi tanpa menyebabkan error memori.
+
+```{r hierarchical}
+set.seed(123)
+hc_idx <- sample(seq_len(nrow(pca_data)), min(max_hclust_rows, nrow(pca_data)))
+pca_hc_sample <- pca_data[hc_idx, , drop = FALSE]
+
+dist_hc <- dist(pca_hc_sample, method = "euclidean")
+hc_average <- hclust(dist_hc, method = "average")
+hc_sample_cluster <- cutree(hc_average, k = k_final)
+
+# Fungsi assignment ke centroid terdekat.
+assign_to_centroids <- function(X, centers) {
+  X <- as.matrix(X)
+  centers <- as.matrix(centers)
+
+  dist_mat <- sapply(seq_len(nrow(centers)), function(j) {
+    rowSums((X - matrix(centers[j, ], nrow = nrow(X), ncol = ncol(X), byrow = TRUE))^2)
+  })
+
+  max.col(-dist_mat)
+}
+
+hc_centroids <- rowsum(pca_hc_sample, group = hc_sample_cluster) / as.vector(table(hc_sample_cluster))
+hc_all_cluster <- assign_to_centroids(pca_data, hc_centroids)
+
+window_features[, Cluster_HClust := as.factor(hc_all_cluster)]
+
+cat("Jumlah sampel hierarchical:", nrow(pca_hc_sample), "\n")
+cat("Ukuran cluster Hierarchical Approximation:\n")
+print(table(window_features$Cluster_HClust))
+```
+
+```{r plot-hierarchical}
+plot(
+  hc_average,
+  labels = FALSE,
+  hang = -1,
+  main = "Dendrogram - Hierarchical Clustering Average Linkage (Sampel)"
+)
+rect.hclust(hc_average, k = k_final)
+
+pca_plot$Cluster <- window_features$Cluster_HClust
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - Hierarchical Average Linkage Approximation",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-hierarchical, results='asis', echo=FALSE}
+hc_tab <- table(window_features$Cluster_HClust)
+cat("**Interpretasi Hierarchical:** Dendrogram menunjukkan proses penggabungan objek dari sampel window berdasarkan average linkage. Karena data penuh terlalu besar untuk matriks jarak, hasil hierarchical digunakan sebagai pendekatan melalui sampel dan centroid. Jika beberapa cabang dendrogram bergabung pada height yang tinggi, berarti kelompok tersebut relatif berbeda dari kelompok lain. Ukuran cluster terbesar pada pendekatan hierarchical adalah **", scales::comma(max(hc_tab)), "** window.\n", sep = "")
+```
+
+# Metode Clustering 4: PAM (Partition Around Medoids)
+
+PAM atau K-Medoids mirip K-Means, tetapi pusat cluster adalah data aktual yang disebut medoid. Metode ini lebih tahan terhadap outlier, tetapi lebih berat daripada K-Means. Karena itu, PAM dilatih pada sampel, lalu seluruh window diassign ke medoid terdekat.
+
+```{r pam}
+set.seed(123)
+pam_idx <- sample(seq_len(nrow(pca_data)), min(max_pam_rows, nrow(pca_data)))
+pca_pam_sample <- pca_data[pam_idx, , drop = FALSE]
+
+pam_result <- pam(pca_pam_sample, k = k_final, metric = "euclidean")
+
+medoid_matrix <- pca_pam_sample[pam_result$id.med, , drop = FALSE]
+pam_all_cluster <- assign_to_centroids(pca_data, medoid_matrix)
+
+window_features[, Cluster_PAM := as.factor(pam_all_cluster)]
+
+cat("Jumlah sampel PAM:", nrow(pca_pam_sample), "\n")
+cat("Ukuran cluster PAM approximation:\n")
+print(table(window_features$Cluster_PAM))
+```
+
+```{r plot-pam}
+pca_plot$Cluster <- window_features$Cluster_PAM
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - PAM / K-Medoids Approximation",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-pam, results='asis', echo=FALSE}
+cat("**Interpretasi PAM:** PAM menggunakan medoid, yaitu window aktual sebagai pusat cluster. Pendekatan ini lebih tahan terhadap outlier dibanding centroid rata-rata pada K-Means. Karena PAM dilatih pada sampel, hasil untuk seluruh data adalah aproksimasi berbasis medoid terdekat. Jika visualisasi PAM lebih stabil atau lebih rapi daripada K-Means, hal itu dapat menunjukkan bahwa medoid lebih representatif untuk pola sensor tertentu.\n")
+```
+
+# Metode Clustering 5: DBSCAN
+
+DBSCAN mengelompokkan data berdasarkan kepadatan. Keunggulannya adalah dapat menemukan noise/outlier dan tidak harus menentukan jumlah cluster sejak awal. Parameter pentingnya adalah `eps` dan `minPts`.
+
+Nilai `eps` ditentukan dari k-distance plot pada sampel data. Pada script ini, `eps` awal dipilih secara otomatis dari kuantil k-distance, tetapi tetap dapat disesuaikan manual setelah melihat plot.
+
+```{r dbscan-eps}
+set.seed(123)
+dbscan_eps_idx <- sample(seq_len(nrow(pca_data)), min(max_distance_rows, nrow(pca_data)))
+pca_dbscan_eps <- pca_data[dbscan_eps_idx, , drop = FALSE]
+
+knn_dist <- dbscan::kNNdist(pca_dbscan_eps, k = min_pts_dbscan)
+eps_opt <- as.numeric(quantile(knn_dist, probs = eps_quantile, na.rm = TRUE))
+
+cat("minPts DBSCAN:", min_pts_dbscan, "\n")
+cat("eps otomatis berdasarkan kuantil", eps_quantile, ":", round(eps_opt, 4), "\n")
+
+dbscan::kNNdistplot(pca_dbscan_eps, k = min_pts_dbscan)
+abline(h = eps_opt, lty = 2)
+title("k-Distance Plot untuk Penentuan eps DBSCAN")
+```
+
+
+```{r interpretasi-dbscan-eps, results='asis', echo=FALSE}
+cat("**Interpretasi k-distance plot:** Garis horizontal menunjukkan nilai eps otomatis sebesar **", round(eps_opt, 4), "**. Pada DBSCAN, eps menentukan radius tetangga. Nilai eps yang terlalu kecil akan menghasilkan banyak noise, sedangkan eps terlalu besar dapat menggabungkan beberapa kelompok yang seharusnya terpisah. Karena itu, hasil DBSCAN perlu dibaca bersama jumlah noise dan visualisasi PCA.\n", sep = "")
+```
+
+```{r dbscan}
+dbscan_result <- dbscan::dbscan(pca_data, eps = eps_opt, minPts = min_pts_dbscan)
+
+window_features[, Cluster_DBSCAN := as.factor(dbscan_result$cluster)]
+
+cat("Ukuran cluster DBSCAN, cluster 0 = noise:\n")
+print(table(window_features$Cluster_DBSCAN))
+```
+
+```{r plot-dbscan}
+pca_plot$Cluster <- window_features$Cluster_DBSCAN
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - DBSCAN",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-dbscan, results='asis', echo=FALSE}
+db_tab <- table(window_features$Cluster_DBSCAN)
+noise_n <- if ("0" %in% names(db_tab)) as.numeric(db_tab["0"]) else 0
+noise_pct <- round(noise_n / nrow(window_features) * 100, 2)
+cluster_non_noise <- setdiff(names(db_tab), "0")
+cat("**Interpretasi DBSCAN:** DBSCAN menghasilkan **", length(cluster_non_noise), "** cluster non-noise dan **", scales::comma(noise_n), "** window noise (**", noise_pct, "%**). ", sep = "")
+if (noise_pct > 20) {
+  cat("Proporsi noise cukup tinggi, sehingga parameter eps/minPts mungkin terlalu ketat atau data memang memiliki banyak pola transisi yang tidak padat.\n")
+} else if (length(cluster_non_noise) <= 1) {
+  cat("Jumlah cluster non-noise sangat sedikit, sehingga DBSCAN kurang mampu memisahkan pola aktivitas dengan parameter saat ini.\n")
+} else {
+  cat("Proporsi noise masih wajar, sehingga DBSCAN dapat digunakan sebagai pembanding untuk mendeteksi pola padat dan outlier.\n")
+}
+```
+
+# Validasi Cluster
+
+Validasi cluster dilakukan dengan dua pendekatan:
+
+1. **External criteria**, karena dataset MHEALTH memiliki `activity_label`. Label ini tidak digunakan saat clustering, tetapi digunakan setelah clustering untuk mengecek apakah hasil cluster sejalan dengan aktivitas asli.
+2. **Internal criteria**, yaitu validasi berdasarkan struktur data dan hasil cluster, seperti silhouette width, Davies-Bouldin Index, dan Calinski-Harabasz Index.
+
+## Fungsi Validasi Eksternal
+
+```{r fungsi-validasi-eksternal}
+purity_score <- function(cluster, label) {
+  tab <- table(cluster, label)
+  sum(apply(tab, 1, max)) / sum(tab)
+}
+
+cluster_accuracy <- function(cluster, label) {
+  tab <- table(cluster, label)
+  mat <- as.matrix(tab)
+
+  n <- max(nrow(mat), ncol(mat))
+  square_mat <- matrix(0, nrow = n, ncol = n)
+  square_mat[seq_len(nrow(mat)), seq_len(ncol(mat))] <- mat
+
+  assignment <- clue::solve_LSAP(max(square_mat) - square_mat)
+  sum(square_mat[cbind(seq_len(n), assignment)]) / sum(mat)
+}
+
+rand_index <- function(cluster, label) {
+  clusterCrit::extCriteria(
+    as.integer(as.factor(cluster)),
+    as.integer(as.factor(label)),
+    "Rand"
+  )$rand
+}
+
+external_validation <- function(cluster, label, method_name) {
+  keep <- !is.na(cluster) & !is.na(label)
+  cluster <- cluster[keep]
+  label <- label[keep]
+
+  data.frame(
+    Metode = method_name,
+    Accuracy = round(cluster_accuracy(cluster, label), 4),
+    Purity = round(purity_score(cluster, label), 4),
+    Rand_Index = round(rand_index(cluster, label), 4),
+    Adjusted_Rand_Index = round(mclust::adjustedRandIndex(cluster, label), 4)
+  )
+}
+```
+
+```{r validasi-eksternal}
+true_label <- as.factor(window_features$activity_label)
+
+validasi_external <- dplyr::bind_rows(
+  external_validation(window_features$Cluster_KMeans, true_label, "K-Means"),
+  external_validation(window_features$Cluster_GMM, true_label, "GMM"),
+  external_validation(window_features$Cluster_HClust, true_label, "Hierarchical Average"),
+  external_validation(window_features$Cluster_PAM, true_label, "PAM / K-Medoids"),
+  external_validation(window_features$Cluster_DBSCAN, true_label, "DBSCAN")
+)
+
+knitr::kable(
+  validasi_external,
+  caption = "Validasi Eksternal terhadap Label Aktivitas Asli"
+)
+```
+
+
+```{r interpretasi-validasi-eksternal, results='asis', echo=FALSE}
+best_ari <- validasi_external[which.max(validasi_external$Adjusted_Rand_Index), ]
+best_purity <- validasi_external[which.max(validasi_external$Purity), ]
+cat("**Interpretasi validasi eksternal:** ARI, Rand Index, accuracy, dan purity membandingkan cluster dengan label aktivitas asli. Metode dengan Adjusted Rand Index tertinggi adalah **", best_ari$Metode, "** dengan ARI = **", best_ari$Adjusted_Rand_Index, "**. Metode dengan purity tertinggi adalah **", best_purity$Metode, "** dengan purity = **", best_purity$Purity, "**. Nilai ini tidak digunakan untuk membentuk cluster, tetapi membantu mengecek apakah pola cluster sejalan dengan aktivitas fisik sebenarnya.\n", sep = "")
+```
+
+## Fungsi Validasi Internal
+
+Validasi internal menggunakan sampel karena membutuhkan matriks jarak. Noise DBSCAN (`cluster = 0`) dikeluarkan dari perhitungan internal.
+
+```{r fungsi-validasi-internal}
+validate_internal <- function(cluster_label, method_name, exclude_noise = FALSE) {
+  label <- as.character(cluster_label)
+  idx <- sample(seq_len(nrow(pca_data)), min(max_internal_validation_rows, nrow(pca_data)))
+
+  if (exclude_noise) {
+    idx <- idx[label[idx] != "0"]
+  }
+
+  label_keep <- label[idx]
+  valid <- !is.na(label_keep)
+  idx <- idx[valid]
+  label_keep <- label_keep[valid]
+
+  if (length(unique(label_keep)) < 2 || length(label_keep) < 3) {
+    return(data.frame(
+      Metode = method_name,
+      N = length(label_keep),
+      Jumlah_Cluster = length(unique(label_keep)),
+      Noise = sum(label == "0", na.rm = TRUE),
+      Silhouette = NA,
+      Davies_Bouldin = NA,
+      Calinski_Harabasz = NA
+    ))
+  }
+
+  x <- pca_data[idx, , drop = FALSE]
+  y <- as.integer(as.factor(label_keep))
+  d <- dist(x)
+
+  sil <- mean(cluster::silhouette(y, d)[, "sil_width"])
+  st <- fpc::cluster.stats(d, y)
+  db <- tryCatch(clusterSim::index.DB(x, y)$DB, error = function(e) NA)
+
+  data.frame(
+    Metode = method_name,
+    N = length(label_keep),
+    Jumlah_Cluster = length(unique(label_keep)),
+    Noise = sum(label == "0", na.rm = TRUE),
+    Silhouette = round(sil, 4),
+    Davies_Bouldin = round(db, 4),
+    Calinski_Harabasz = round(st$ch, 2)
+  )
+}
+```
+
+```{r validasi-internal}
+set.seed(123)
+validasi_internal <- dplyr::bind_rows(
+  validate_internal(window_features$Cluster_KMeans, "K-Means"),
+  validate_internal(window_features$Cluster_GMM, "GMM"),
+  validate_internal(window_features$Cluster_HClust, "Hierarchical Average"),
+  validate_internal(window_features$Cluster_PAM, "PAM / K-Medoids"),
+  validate_internal(window_features$Cluster_DBSCAN, "DBSCAN", exclude_noise = TRUE)
+)
+
+validasi_internal_ranked <- validasi_internal %>%
+  mutate(
+    Rank_Silhouette = ifelse(is.na(Silhouette), Inf, rank(-Silhouette, ties.method = "min")),
+    Rank_DB = ifelse(is.na(Davies_Bouldin), Inf, rank(Davies_Bouldin, ties.method = "min")),
+    Rank_CH = ifelse(is.na(Calinski_Harabasz), Inf, rank(-Calinski_Harabasz, ties.method = "min")),
+    Rank_Total = Rank_Silhouette + Rank_DB + Rank_CH
+  ) %>%
+  arrange(Rank_Total, desc(Silhouette), Davies_Bouldin, desc(Calinski_Harabasz))
+
+knitr::kable(
+  validasi_internal_ranked,
+  caption = "Validasi Internal Semua Algoritma"
+)
+```
+
+
+```{r interpretasi-validasi-internal, results='asis', echo=FALSE}
+best_internal <- validasi_internal_ranked[1, ]
+cat("**Interpretasi validasi internal:** Validasi internal menilai kualitas cluster tanpa melihat label aktivitas. Berdasarkan gabungan ranking Silhouette, Davies-Bouldin, dan Calinski-Harabasz, metode terbaik adalah **", best_internal$Metode, "**. Silhouette yang lebih tinggi menunjukkan cluster lebih kompak dan terpisah, Davies-Bouldin yang lebih rendah menunjukkan pemisahan lebih baik, sedangkan Calinski-Harabasz yang lebih tinggi menunjukkan struktur cluster lebih kuat.\n", sep = "")
+```
+
+## Perbandingan Validasi dan Pemilihan Cluster Final
+
+Cluster final dipilih berdasarkan kombinasi validasi. Secara umum, hasil yang baik memiliki Silhouette tinggi, Davies-Bouldin rendah, Calinski-Harabasz tinggi, dan ARI/Purity yang lebih baik terhadap label aktivitas.
+
+```{r pemilihan-cluster-final}
+validasi_gabungan <- merge(
+  validasi_internal_ranked,
+  validasi_external,
+  by = "Metode",
+  all = TRUE
+)
+
+knitr::kable(
+  validasi_gabungan,
+  caption = "Gabungan Validasi Internal dan Eksternal"
+)
+
+# Secara default pilih metode terbaik berdasarkan ranking internal.
+# Jika ingin memilih berdasarkan ARI, ganti baris ini dengan:
+# best_method <- validasi_gabungan$Metode[which.max(validasi_gabungan$Adjusted_Rand_Index)]
+best_method <- validasi_internal_ranked$Metode[1]
+
+cluster_candidates <- list(
+  "K-Means" = window_features$Cluster_KMeans,
+  "GMM" = window_features$Cluster_GMM,
+  "Hierarchical Average" = window_features$Cluster_HClust,
+  "PAM / K-Medoids" = window_features$Cluster_PAM,
+  "DBSCAN" = window_features$Cluster_DBSCAN
+)
+
+window_features[, Cluster_Final := as.factor(cluster_candidates[[best_method]])]
+
+cat("Metode cluster final:", best_method, "\n")
+cat("Ukuran cluster final:\n")
+print(table(window_features$Cluster_Final))
+```
+
+
+```{r interpretasi-pemilihan-final, results='asis', echo=FALSE}
+cat("**Interpretasi pemilihan final:** Metode final yang dipakai adalah **", best_method, "** karena memiliki performa internal terbaik berdasarkan ranking gabungan. Pemilihan berbasis internal lebih sesuai untuk kerangka unsupervised learning karena label aktivitas tidak dipakai saat proses clustering. Label aktivitas baru digunakan setelahnya untuk verifikasi.\n", sep = "")
+```
+
+## Tabel Kontingensi Cluster Final dan Label Aktivitas
+
+```{r kontingensi-final}
+contingency_final <- table(
+  Cluster_Final = window_features$Cluster_Final,
+  Activity_Label = window_features$activity_label
+)
+
+knitr::kable(
+  contingency_final,
+  caption = "Tabel Kontingensi Cluster Final terhadap Label Aktivitas"
+)
+```
+
+
+```{r interpretasi-kontingensi-final, results='asis', echo=FALSE}
+cont_df <- as.data.frame.matrix(contingency_final)
+row_totals <- rowSums(cont_df)
+row_max <- apply(cont_df, 1, max)
+row_purity <- row_max / pmax(row_totals, 1)
+mean_row_purity <- round(mean(row_purity, na.rm = TRUE) * 100, 2)
+cat("**Interpretasi tabel kontingensi:** Tabel ini menunjukkan hubungan antara cluster final dan label aktivitas asli. Rata-rata kemurnian dominan per cluster sekitar **", mean_row_purity, "%**. Jika satu cluster didominasi oleh satu label aktivitas, cluster tersebut lebih mudah diinterpretasikan sebagai pola aktivitas tertentu. Jika satu cluster berisi banyak label, cluster tersebut kemungkinan menangkap kemiripan sinyal antar aktivitas, aktivitas transisi, atau variasi gerakan antar subjek.\n", sep = "")
+```
+
+# Visualisasi Akhir
+
+Visualisasi akhir menggunakan PCA 2D. Plot pertama menunjukkan cluster final, sedangkan plot kedua menunjukkan label aktivitas asli sebagai pembanding.
+
+```{r visualisasi-akhir-cluster}
+pca_final_plot <- data.frame(
+  PC1 = pca_data[, 1],
+  PC2 = pca_data[, 2],
+  Cluster_Final = window_features$Cluster_Final,
+  Activity_Label = as.factor(window_features$activity_label),
+  Subject = window_features$subject_id
+)
+
+ggplot(pca_final_plot, aes(x = PC1, y = PC2, color = Cluster_Final)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  labs(
+    title = paste("Visualisasi PCA 2D - Cluster Final (", best_method, ")", sep = ""),
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_bw()
+```
+
+```{r visualisasi-akhir-label}
+ggplot(pca_final_plot, aes(x = PC1, y = PC2, color = Activity_Label)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  labs(
+    title = "Visualisasi PCA 2D - Label Aktivitas Asli",
+    x = "PC1",
+    y = "PC2",
+    color = "Aktivitas"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-visualisasi-akhir, results='asis', echo=FALSE}
+cat("**Interpretasi visualisasi akhir:** Plot cluster final memperlihatkan struktur hasil unsupervised learning pada ruang PCA dua dimensi, sedangkan plot label aktivitas asli digunakan sebagai pembanding. Area yang warnanya konsisten menunjukkan pemisahan pola sensor yang kuat. Area yang saling bertumpuk menunjukkan bahwa beberapa aktivitas memiliki pola sensor yang mirip atau bahwa informasi penting berada pada komponen PCA lain di luar PC1 dan PC2. Oleh karena itu, visualisasi 2D bersifat pendukung, sedangkan keputusan akhir tetap mengacu pada tabel validasi dan profiling cluster.\n")
+```
+
+# Profiling dan Interpretasi
+
+Profiling dilakukan untuk memahami karakter setiap cluster. Karena data berasal dari sensor, interpretasi utama dilakukan melalui distribusi label aktivitas dominan pada setiap cluster dan distribusi subjek.
+
+```{r profiling-cluster}
+cluster_size <- as.data.table(table(window_features$Cluster_Final))
+setnames(cluster_size, c("Cluster_Final", "N"))
+cluster_size[, Persentase := round(N / sum(N) * 100, 2)]
+
+knitr::kable(
+  cluster_size,
+  caption = "Ukuran Cluster Final",
+  format.args = list(big.mark = ",")
+)
+
+activity_by_cluster <- window_features[, .N, by = .(Cluster_Final, activity_label)]
+activity_by_cluster <- merge(activity_by_cluster, activity_map, by = "activity_label", all.x = TRUE)
+activity_by_cluster[, Proporsi := round(N / sum(N) * 100, 2), by = Cluster_Final]
+
+knitr::kable(
+  activity_by_cluster[order(Cluster_Final, -N)],
+  caption = "Distribusi Aktivitas pada Setiap Cluster",
+  format.args = list(big.mark = ",")
+)
+
+dominant_activity <- activity_by_cluster[order(Cluster_Final, -N), .SD[1], by = Cluster_Final]
+knitr::kable(
+  dominant_activity,
+  caption = "Aktivitas Dominan pada Setiap Cluster",
+  format.args = list(big.mark = ",")
+)
+```
+
+```{r distribusi-subjek-cluster}
+subject_cluster <- as.data.table(table(window_features$Cluster_Final, window_features$subject_id))
+setnames(subject_cluster, c("Cluster_Final", "Subject", "N"))
+
+knitr::kable(
+  subject_cluster[order(Cluster_Final, Subject)],
+  caption = "Distribusi Subjek pada Setiap Cluster",
+  format.args = list(big.mark = ",")
+)
+
+ggplot(subject_cluster, aes(x = Subject, y = N, fill = Cluster_Final)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Distribusi Cluster Berdasarkan Subjek",
+    x = "Subjek",
+    y = "Jumlah Window",
+    fill = "Cluster"
+  ) +
+  theme_bw()
+```
+
+
+```{r interpretasi-distribusi-subjek, results='asis', echo=FALSE}
+subject_prop <- subject_cluster[, .(N = sum(N)), by = .(Cluster_Final, Subject)]
+subject_prop[, Proporsi := N / sum(N) * 100, by = Cluster_Final]
+max_subject_prop <- subject_prop[, .SD[which.max(Proporsi)], by = Cluster_Final]
+cluster_subject_bias <- max_subject_prop[Proporsi >= 70]
+
+if (nrow(cluster_subject_bias) == 0) {
+  cat("**Interpretasi distribusi subjek:** Tidak ada cluster yang sangat didominasi oleh satu subjek. Ini mengindikasikan bahwa cluster lebih mungkin merepresentasikan pola aktivitas/sensor umum daripada hanya karakteristik individu tertentu.\n")
+} else {
+  cat("**Interpretasi distribusi subjek:** Terdapat cluster yang cukup didominasi oleh subjek tertentu. Hal ini perlu diperhatikan karena pada data sensor, pola gerak individu dapat memengaruhi hasil clustering. Cluster yang didominasi satu subjek sebaiknya tidak langsung ditafsirkan sebagai aktivitas murni tanpa melihat distribusi label aktivitasnya.\n")
+}
+```
+
+```{r interpretasi-otomatis, results='asis'}
+cat("## Interpretasi Ringkas Cluster\n\n")
+
+for (i in seq_len(nrow(dominant_activity))) {
+  cl <- dominant_activity$Cluster_Final[i]
+  act <- dominant_activity$activity_name[i]
+  prop <- dominant_activity$Proporsi[i]
+  n_cluster <- cluster_size$N[cluster_size$Cluster_Final == cl]
+
+  cat("### Cluster ", cl, "\n\n", sep = "")
+  cat("Cluster ini berisi **", scales::comma(n_cluster), " window**. ", sep = "")
+  cat("Aktivitas yang paling dominan pada cluster ini adalah **", act, "** ", sep = "")
+  cat("dengan proporsi sekitar **", prop, "%** dari seluruh window pada cluster tersebut.\n\n", sep = "")
+
+  if (prop >= 70) {
+    cat("Interpretasi: cluster ini relatif homogen dan cukup kuat merepresentasikan aktivitas tersebut.\n\n")
+  } else if (prop >= 40) {
+    cat("Interpretasi: cluster ini cukup berkaitan dengan aktivitas dominan, tetapi masih bercampur dengan aktivitas lain.\n\n")
+  } else {
+    cat("Interpretasi: cluster ini masih heterogen sehingga kemungkinan merepresentasikan pola sensor gabungan, transisi, atau variasi antar subjek.\n\n")
+  }
+}
+```
+
+# Simpan Output
+
+Hasil akhir disimpan agar dapat digunakan kembali tanpa mengulang seluruh proses preprocessing dan clustering.
+
+```{r simpan-output}
+data.table::fwrite(window_features, "mhealth_window_features_with_clusters.csv")
+data.table::fwrite(validasi_gabungan, "mhealth_cluster_validation_summary.csv")
+
+cat("File berhasil disimpan:\n")
+cat("1. mhealth_window_features_with_clusters.csv\n")
+cat("2. mhealth_cluster_validation_summary.csv\n")
+```
+
+# Kesimpulan
+
+Analisis ini menunjukkan bahwa dataset MHEALTH dapat digunakan untuk unsupervised learning dan clustering, tetapi perlu diproses secara khusus karena merupakan data time-series sensor. Data mentah terlebih dahulu diubah menjadi fitur berbasis window, kemudian distandarisasi, direduksi dimensinya menggunakan PCA, dan dianalisis menggunakan beberapa metode clustering.
+
+Metode yang dibandingkan meliputi K-Means, Gaussian Mixture Model, Hierarchical Clustering dengan average linkage, PAM/K-Medoids, dan DBSCAN. Validasi dilakukan menggunakan internal criteria dan external criteria. Label aktivitas hanya digunakan untuk evaluasi akhir, bukan sebagai input clustering.
+
+
