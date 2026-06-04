@@ -1,4 +1,4 @@
-# MHEALTH-Unsupervised-Clustering
+# Project-UAS-SML-MHEALTH-Unsupervised-Clustering
 Projek Statistical Machine Learning Unsupervised Clustering
 
 # Analisis Clustering Aktivitas Fisik Berdasarkan Data Sensor MHEALTH
