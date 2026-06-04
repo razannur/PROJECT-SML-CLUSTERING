@@ -3,15 +3,6 @@ Projek Statistical Machine Learning Unsupervised Clustering
 
 # MHEALTH-Unsupervised-Clustering
 
-<div align="center">
-
-![R](https://img.shields.io/badge/R-4.5.1-276DC3?style=for-the-badge&logo=r&logoColor=white)
-![R Markdown](https://img.shields.io/badge/R%20Markdown-Analysis-blue?style=for-the-badge)
-![Machine Learning](https://img.shields.io/badge/Unsupervised%20Learning-Clustering-orange?style=for-the-badge)
-![Status](https://img.shields.io/badge/Status-Completed-brightgreen?style=for-the-badge)
-
-</div>
-
 # Analisis Clustering Aktivitas Fisik Berdasarkan Data Sensor MHEALTH
 
 *MHEALTH Dataset : UCI Machine Learning Repository*
