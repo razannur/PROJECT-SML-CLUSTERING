@@ -238,40 +238,6 @@ Interpretasi umum:
 
 ---
 
-## Struktur File
-
-Struktur repository yang disarankan:
-
-```text
-MHEALTH-Unsupervised-Clustering/
-│
-├── README.md
-├── mhealth_unsupervised_clustering_optimized_with_interpretation.Rmd
-├── mhealth_combined_10_subjects.csv
-│
-├── outputs/
-│   └── hasil_laporan.html
-│
-└── notes/
-    └── README_data.txt
-```
-
-Jika file CSV terlalu besar untuk diunggah langsung ke GitHub, gunakan struktur berikut:
-
-```text
-MHEALTH-Unsupervised-Clustering/
-│
-├── README.md
-├── mhealth_unsupervised_clustering_optimized_with_interpretation.Rmd
-│
-└── notes/
-    └── README_data.txt
-```
-
-Lalu simpan file CSV secara lokal di folder yang sama dengan file `.Rmd` sebelum menjalankan analisis.
-
----
-
 ## Cara Menjalankan
 
 ### 1. Clone repository
