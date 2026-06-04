@@ -1,8 +1,6 @@
 # MHEALTH-Unsupervised-Clustering
 Projek Statistical Machine Learning Unsupervised Clustering
 
-# MHEALTH-Unsupervised-Clustering
-
 # Analisis Clustering Aktivitas Fisik Berdasarkan Data Sensor MHEALTH
 
 *MHEALTH Dataset : UCI Machine Learning Repository*
